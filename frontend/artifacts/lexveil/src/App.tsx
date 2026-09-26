@@ -1,0 +1,121 @@
+import { type ReactNode, useMemo, useRef, useState } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { AlertCircle, ArrowLeft, BookOpen, Check, ChevronRight, CircleHelp, Clipboard, Download, FileText, FolderOpen, Highlighter, Loader2, MessageSquareText, PanelLeft, RotateCcw, Send, ShieldAlert, Sparkles, Upload } from 'lucide-react';
+import { ErrorBoundary } from '@/components/error-boundary';
+import { Toaster } from '@/components/ui/toaster';
+import { TooltipProvider } from '@/components/ui/tooltip';
+import NotFound from '@/pages/not-found';
+import { Route, Switch, Router as WouterRouter, useLocation } from 'wouter';
+import { askDocument, exportDocument, type AskResponse, type DocumentRecord, LexVeilApiError, uploadDocument } from '@/services/lexveil-api';
+
+const queryClient = new QueryClient();
+
+type NormalizedClause = { id: string; title: string; text: string; summary: string; risk: string; severity: string; confidence?: string };
+type NormalizedCitation = { id: string; label: string; quote: string; page?: string; clause?: string };
+
+function normalizeDocument(payload: DocumentRecord): DocumentRecord {
+  const source = payload as Record<string, unknown>;
+  const raw = source.document && typeof source.document === 'object' ? source.document as Record<string, unknown> : source;
+  return { ...raw, id: String(raw.id ?? raw.documentId ?? ''), title: String(raw.title ?? raw.fileName ?? raw.filename ?? 'Untitled document'), originalText: String(raw.originalText ?? raw.text ?? raw.content ?? ''), clauses: Array.isArray(raw.clauses) ? raw.clauses : [], risks: Array.isArray(raw.risks) ? raw.risks : [] } as DocumentRecord;
+}
+
+function getClause(raw: unknown, index: number): NormalizedClause {
+  const item = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  return { id: String(item.id ?? item.clauseId ?? index), title: String(item.title ?? item.name ?? item.label ?? `Clause ${index + 1}`), text: String(item.text ?? item.sourceText ?? item.clauseText ?? ''), summary: String(item.summary ?? item.description ?? ''), risk: String(item.risk ?? item.riskLevel ?? ''), severity: String(item.severity ?? item.riskLevel ?? ''), confidence: item.confidence === undefined ? undefined : String(item.confidence) };
+}
+
+function getCitation(raw: unknown, index: number): NormalizedCitation {
+  const item = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  return { id: String(item.id ?? item.citationId ?? index), label: String(item.label ?? item.title ?? `Source ${index + 1}`), quote: String(item.quote ?? item.text ?? item.sourceText ?? item.excerpt ?? ''), page: item.page === undefined ? undefined : String(item.page), clause: item.clause === undefined ? undefined : String(item.clause) };
+}
+
+function ErrorNotice({ message, onRetry }: { message: string; onRetry?: () => void }) {
+  return <div role="alert" className="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive" data-testid="status-error"><AlertCircle className="mt-0.5 size-4 shrink-0" aria-hidden="true" /><div className="flex-1"><p className="font-semibold">Something needs attention</p><p className="mt-1 opacity-85">{message}</p></div>{onRetry && <button className="focus-ring rounded px-2 py-1 text-xs font-semibold underline underline-offset-4" onClick={onRetry} data-testid="button-retry">Retry</button>}</div>;
+}
+
+function BrandMark() {
+  return <div className="flex items-center gap-3"><div className="flex size-9 items-center justify-center rounded-md bg-sidebar-primary text-sidebar-primary-foreground"><span className="font-display text-xl">L</span></div><div><div className="font-display text-xl leading-none tracking-tight">LexVeil</div><div className="eyebrow mt-1 opacity-60">Document intelligence</div></div></div>;
+}
+
+function AppShell({ children, onNew }: { children: ReactNode; onNew?: () => void }) {
+  const [mobileNav, setMobileNav] = useState(false);
+  return <div className="noise flex min-h-[100dvh] bg-background"><a href="#main-content" className="focus-ring sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-md focus:bg-primary focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:text-primary-foreground">Skip to main content</a><nav aria-label="Document workspace" className={`fixed inset-y-0 left-0 z-40 flex w-[248px] flex-col bg-sidebar px-5 py-6 text-sidebar-foreground transition-transform duration-300 md:relative md:translate-x-0 ${mobileNav ? 'translate-x-0' : '-translate-x-full'}`}><BrandMark /><div className="mt-12"><div className="eyebrow px-3 opacity-45">Workspace</div><div className="mt-3 flex w-full items-center gap-3 rounded-md bg-sidebar-accent px-3 py-2.5 text-sm font-medium text-sidebar-accent-foreground" data-testid="nav-current-document"><FileText className="size-4 opacity-80" aria-hidden="true" />Current document</div>{onNew && <button className="focus-ring mt-1 flex w-full items-center gap-3 rounded-md px-3 py-2.5 text-left text-sm opacity-55 transition-colors hover:bg-sidebar-accent hover:opacity-100" onClick={onNew} data-testid="button-new-document"><RotateCcw className="size-4" aria-hidden="true" />New analysis</button>}</div><div className="mt-auto border-t border-sidebar-border pt-5"><div className="flex items-center gap-3 px-2 text-xs opacity-55"><CircleHelp className="size-4" aria-hidden="true" /><span>Analysis is assistive, not legal advice.</span></div></div></nav>{mobileNav && <button aria-label="Close navigation" className="fixed inset-0 z-30 bg-sidebar/20 md:hidden" onClick={() => setMobileNav(false)} data-testid="button-close-navigation" />}<main id="main-content" className="min-w-0 flex-1"><div className="flex h-16 items-center border-b border-border/80 px-5 md:hidden"><button aria-label="Open navigation" className="focus-ring mr-3 rounded p-1" onClick={() => setMobileNav(true)} data-testid="button-open-navigation"><PanelLeft className="size-5" aria-hidden="true" /></button><BrandMark /></div>{children}</main></div>;
+}
+
+function UploadPage({ onUploaded }: { onUploaded: (document: DocumentRecord) => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [mode, setMode] = useState<'upload' | 'paste'>('upload');
+  const [file, setFile] = useState<File | null>(null);
+  const [text, setText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function submit() {
+    if (mode === 'upload' && !file) return;
+    if (mode === 'paste' && !text.trim()) return;
+    setBusy(true); setError('');
+    try { onUploaded(normalizeDocument(await uploadDocument(mode === 'upload' ? file as File : text.trim()))); } catch (err) { setError(err instanceof LexVeilApiError ? err.message : 'The document could not be submitted.'); } finally { setBusy(false); }
+  }
+  return <AppShell><div className="mx-auto flex min-h-[100dvh] max-w-5xl flex-col px-5 py-8 md:px-10 md:py-12"><div className="hidden items-center justify-between md:flex"><BrandMark /><div className="eyebrow text-muted-foreground">Private workspace / no document history</div></div><div className="my-auto py-12"><div className="max-w-2xl animate-rise"><div className="eyebrow flex items-center gap-2 text-primary"><span className="size-1.5 rounded-full bg-accent" />Start an analysis</div><h1 className="mt-5 max-w-xl font-display text-5xl leading-[.98] tracking-tight text-foreground md:text-7xl">Read the fine print with a second set of eyes.</h1><p className="mt-6 max-w-lg text-base leading-7 text-muted-foreground">Bring a contract, policy, or filing into a focused legal workspace. LexVeil keeps every observation tied to its source text.</p></div><div className="mt-12 max-w-3xl animate-rise [animation-delay:100ms]"><div className="flex gap-1 border-b border-border"><button className={`focus-ring -mb-px flex items-center gap-2 border-b-2 px-4 py-3 text-sm font-semibold ${mode === 'upload' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground'}`} onClick={() => setMode('upload')} aria-pressed={mode === 'upload'} data-testid="tab-upload"><Upload className="size-4" aria-hidden="true" />Upload PDF</button><button className={`focus-ring -mb-px flex items-center gap-2 border-b-2 px-4 py-3 text-sm font-semibold ${mode === 'paste' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground'}`} onClick={() => setMode('paste')} aria-pressed={mode === 'paste'} data-testid="tab-paste"><Clipboard className="size-4" aria-hidden="true" />Paste text</button></div>{mode === 'upload' ? <button className="focus-ring mt-5 flex min-h-48 w-full flex-col items-center justify-center rounded-lg border border-dashed border-primary/35 bg-card/55 px-6 text-center transition-colors hover:border-primary/70 hover:bg-card" onClick={() => inputRef.current?.click()} data-testid="dropzone-document"><input ref={inputRef} type="file" accept="application/pdf,.pdf" className="hidden" aria-label="Choose a PDF document to upload" onChange={(event) => setFile(event.target.files?.[0] ?? null)} data-testid="input-document" /><div className="flex size-12 items-center justify-center rounded-full bg-secondary text-secondary-foreground"><FolderOpen className="size-5" aria-hidden="true" /></div><span className="mt-4 text-sm font-semibold">{file ? file.name : 'Choose a PDF to begin'}</span><span className="mt-1 text-xs text-muted-foreground">{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB · ready to analyze` : 'Drop it here or browse from your device'}</span></button> : <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="Paste the document text here…" aria-label="Document text to analyze" className="focus-ring mt-5 min-h-48 w-full resize-y rounded-lg border border-border bg-card/55 p-5 text-sm leading-7 outline-none placeholder:text-muted-foreground/65" data-testid="textarea-document" />}{error && <div className="mt-4"><ErrorNotice message={error} /></div>}<div className="mt-5 flex items-center justify-between gap-4"><p className="text-xs leading-5 text-muted-foreground">Your document is sent to the configured LexVeil service for analysis.</p><button className="focus-ring flex shrink-0 items-center gap-2 rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-transform hover:-translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-45" disabled={busy || (mode === 'upload' ? !file : !text.trim())} onClick={submit} data-testid="button-analyze">{busy ? <><Loader2 className="size-4 animate-spin" />Sending…</> : <>Analyze document <ChevronRight className="size-4" /></>}</button></div></div></div><div className="flex items-center gap-2 text-xs text-muted-foreground"><ShieldAlert className="size-3.5" aria-hidden="true" />Always review outputs against the original document and applicable authority.</div></div></AppShell>;
+}
+
+function ProcessingPage() {
+  return <AppShell><div className="mx-auto max-w-3xl px-5 py-12 md:px-10 md:py-20"><div className="eyebrow text-primary">LexVeil is reading</div><h1 className="mt-4 font-display text-5xl leading-none">Preparing your workspace.</h1><p className="mt-5 text-muted-foreground">We’re mapping the document so every finding can point back to its source.</p><div className="mt-12 space-y-4">{[0, 1, 2, 3].map((item) => <div key={item} className="flex items-center gap-4"><div className="skeleton h-11 flex-1 rounded-md" /><div className="skeleton h-3 w-16 rounded" /></div>)}</div></div></AppShell>;
+}
+
+function HighlightedSource({ text, query }: { text: string; query: string }) {
+  if (!text) return <div className="flex min-h-96 items-center justify-center rounded-lg border border-dashed border-border p-8 text-center text-sm text-muted-foreground" data-testid="empty-original-text"><div><BookOpen className="mx-auto mb-3 size-5 opacity-50" /><p>Original text was not included in the response.</p><p className="mt-1 text-xs">Source highlighting will be available when the service returns it.</p></div></div>;
+  if (!query) return <p className="whitespace-pre-wrap text-[15px] leading-8 text-foreground/85" data-testid="text-original-document">{text}</p>;
+  const index = text.toLowerCase().indexOf(query.toLowerCase());
+  if (index < 0) return <p className="whitespace-pre-wrap text-[15px] leading-8 text-foreground/85" data-testid="text-original-document">{text}</p>;
+  return <p className="whitespace-pre-wrap text-[15px] leading-8 text-foreground/85" data-testid="text-original-document">{text.slice(0, index)}<mark className="rounded bg-accent/55 px-1 text-foreground">{text.slice(index, index + query.length)}</mark>{text.slice(index + query.length)}</p>;
+}
+
+function AskPanel({ documentId, onCitation }: { documentId: string; onCitation: (citation: NormalizedCitation) => void }) {
+  const [question, setQuestion] = useState('');
+  const [response, setResponse] = useState<AskResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function submit() {
+    if (!question.trim() || !documentId) return;
+    setBusy(true); setError(''); setResponse(null);
+    try { setResponse(await askDocument(documentId, question.trim())); } catch (err) { setError(err instanceof LexVeilApiError ? err.message : 'The question could not be answered.'); } finally { setBusy(false); }
+  }
+  const citations = Array.isArray(response?.citations) ? response.citations.map(getCitation) : [];
+  return <section className="border-t border-border pt-5" data-testid="panel-ask-lexi" aria-label="Ask Lexi about this document"><div className="flex items-center gap-2"><MessageSquareText className="size-4 text-primary" aria-hidden="true" /><h2 className="text-sm font-semibold">Ask Lexi</h2><span className="eyebrow ml-auto text-muted-foreground">Document-aware</span></div><div className="mt-3 flex gap-2 rounded-md border border-border bg-background p-2 focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10"><input value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') submit(); }} placeholder="Ask about this document…" aria-label="Ask a question about this document" className="min-w-0 flex-1 bg-transparent px-2 text-sm outline-none placeholder:text-muted-foreground/65" data-testid="input-ask-question" /><button aria-label="Ask Lexi" className="focus-ring rounded bg-primary p-2 text-primary-foreground disabled:opacity-40" disabled={busy || !question.trim()} onClick={submit} data-testid="button-ask"><Send className="size-4" aria-hidden="true" /></button></div>{error && <div className="mt-3"><ErrorNotice message={error} /></div>}{busy && <div className="mt-4 space-y-2" data-testid="status-asking" role="status" aria-live="polite" aria-label="Asking Lexi"><div className="skeleton h-3 w-full rounded" /><div className="skeleton h-3 w-4/5 rounded" /><div className="skeleton h-3 w-2/5 rounded" /></div>}{response && !busy && <div className="mt-4 animate-rise"><div className="rounded-md bg-secondary/60 p-4 text-sm leading-6" data-testid="text-ask-answer" role="status">{response.canAnswer === false ? 'Lexi could not answer this from the supplied document.' : response.answer || 'The service returned no answer.'}</div>{citations.length > 0 && <div className="mt-3 space-y-1.5"><div className="eyebrow text-muted-foreground">Citations</div>{citations.map((citation) => <button key={citation.id} onClick={() => onCitation(citation)} className="focus-ring flex w-full items-start gap-2 rounded px-2 py-1.5 text-left text-xs text-primary transition-colors hover:bg-secondary" data-testid={`button-citation-${citation.id}`}><Highlighter className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />{citation.label}{citation.page && <span className="ml-auto text-muted-foreground">p. {citation.page}</span>}</button>)}</div>}</div>}</section>;
+}
+
+function Workspace({ document: doc, onReset }: { document: DocumentRecord; onReset: () => void }) {
+  const [selectedCitation, setSelectedCitation] = useState<NormalizedCitation | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState('');
+  const clauses = useMemo(() => doc.clauses.map(getClause), [doc.clauses]);
+  const risks = useMemo(() => doc.risks.map((risk, index) => getClause(risk, index)), [doc.risks]);
+  const [activeClause, setActiveClause] = useState<string | null>(null);
+  async function handleExport() {
+    if (!doc.id) return;
+    setExporting(true); setExportError('');
+    try { const result = await exportDocument(doc.id); const url = URL.createObjectURL(result.blob); const anchor = window.document.createElement('a'); anchor.href = url; anchor.download = result.filename; anchor.click(); URL.revokeObjectURL(url); } catch (err) { setExportError(err instanceof LexVeilApiError ? err.message : 'The brief could not be exported.'); } finally { setExporting(false); }
+  }
+  const highlightQuery = selectedCitation?.quote || (activeClause ? clauses.find((clause) => clause.id === activeClause)?.text || '' : '');
+  return <AppShell onNew={onReset}><header className="sticky top-0 z-20 flex min-h-16 items-center justify-between gap-4 border-b border-border/80 bg-background/95 px-5 backdrop-blur md:px-8"><div className="flex min-w-0 items-center gap-3"><button className="focus-ring rounded p-1.5 text-muted-foreground hover:bg-muted" onClick={onReset} aria-label="Back to new analysis" data-testid="button-back-to-upload"><ArrowLeft className="size-4" /></button><div className="min-w-0"><div className="eyebrow text-muted-foreground">Current document</div><h1 className="truncate text-sm font-semibold" data-testid="text-document-title">{doc.title}</h1></div></div><div className="flex shrink-0 items-center gap-2"><button className="focus-ring hidden items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-xs font-semibold transition-colors hover:border-primary/45 sm:flex" onClick={onReset} data-testid="button-new-analysis"><RotateCcw className="size-3.5" />New analysis</button><button className="focus-ring flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground transition-transform hover:-translate-y-0.5 disabled:opacity-50" onClick={handleExport} disabled={exporting || !doc.id} data-testid="button-export-brief">{exporting ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}{exporting ? 'Generating…' : 'Export brief'}</button></div></header>{exportError && <div className="mx-5 mt-4 md:mx-8"><ErrorNotice message={exportError} /></div>}<div className="grid min-h-[calc(100dvh-4rem)] grid-cols-1 xl:grid-cols-[210px_minmax(0,1fr)_340px]"><aside className="hidden border-r border-border bg-card/25 p-5 xl:block"><div className="eyebrow text-muted-foreground">Contents</div><div className="mt-5 space-y-1">{clauses.length ? clauses.map((clause, index) => <button key={clause.id} onClick={() => { setActiveClause(clause.id); setSelectedCitation(null); }} className={`focus-ring flex w-full items-start gap-2 rounded px-2 py-2 text-left text-xs transition-colors ${activeClause === clause.id ? 'bg-secondary font-semibold text-secondary-foreground' : 'text-muted-foreground hover:bg-muted'}`} data-testid={`button-clause-${clause.id}`}><span className="font-mono text-[10px] opacity-60">{String(index + 1).padStart(2, '0')}</span><span className="line-clamp-2">{clause.title}</span></button>) : <div className="rounded-md border border-dashed border-border p-3 text-xs leading-5 text-muted-foreground" data-testid="empty-clauses">No clauses were returned.</div>}</div></aside><section className="min-w-0 px-5 py-7 md:px-8 md:py-9"><div className="mx-auto max-w-3xl"><div className="flex items-start justify-between gap-5"><div><div className="eyebrow text-primary">Source document</div><h2 className="mt-2 font-display text-3xl">Read in context.</h2></div><div className="hidden items-center gap-2 text-xs text-muted-foreground md:flex"><span className="size-1.5 rounded-full bg-primary" />{doc.originalText ? `${doc.originalText.split(/\s+/).filter(Boolean).length.toLocaleString()} words` : 'Text unavailable'}</div></div><div className="mt-8 rounded-lg border border-border bg-card px-6 py-7 shadow-[0_8px_30px_hsl(218_28%_17%/_.04)] md:px-10 md:py-10"><HighlightedSource text={doc.originalText} query={highlightQuery} /></div></div></section><aside className="border-t border-border bg-card/40 px-5 py-7 md:px-8 xl:border-l xl:border-t-0"><div className="mx-auto max-w-xl xl:max-w-none"><div className="eyebrow text-primary">Analysis</div><h2 className="mt-2 font-display text-3xl">What needs a closer look?</h2>{clauses.length > 0 ? <div className="mt-7 space-y-3" data-testid="list-clauses">{clauses.map((clause) => <button key={clause.id} onClick={() => { setActiveClause(clause.id); setSelectedCitation(null); }} className={`focus-ring w-full rounded-lg border p-4 text-left transition-colors ${activeClause === clause.id ? 'border-primary/60 bg-secondary/45' : 'border-border bg-background/50 hover:border-primary/35'}`} data-testid={`card-clause-${clause.id}`}><div className="flex items-start justify-between gap-3"><span className="text-sm font-semibold">{clause.title}</span>{clause.severity && <span className="eyebrow rounded bg-accent/25 px-1.5 py-1 text-[9px] text-accent-foreground">{clause.severity}</span>}</div>{clause.summary && <p className="mt-2 text-xs leading-5 text-muted-foreground">{clause.summary}</p>}{clause.confidence && <div className="mt-3 flex items-center gap-2 text-[10px] text-muted-foreground"><Check className="size-3 text-primary" />Confidence {clause.confidence}</div>}</button>)}</div> : <div className="mt-7 rounded-lg border border-dashed border-border p-5 text-sm leading-6 text-muted-foreground" data-testid="empty-analysis"><Sparkles className="mb-3 size-5 text-primary/70" /><p>No clause analysis was returned for this document.</p><p className="mt-1 text-xs">Ask Lexi a question below or review the source text directly.</p></div>}{risks.length > 0 && <div className="mt-7 border-t border-border pt-5"><div className="eyebrow text-destructive">Risk signals</div><div className="mt-3 space-y-2">{risks.map((risk) => <div key={risk.id} className="rounded-md border border-destructive/20 bg-destructive/5 p-3 text-xs"><div className="flex gap-2 font-semibold"><ShieldAlert className="size-3.5 text-destructive" />{risk.title}</div>{risk.summary && <p className="mt-1.5 leading-5 text-muted-foreground">{risk.summary}</p>}</div>)}</div></div>}<div className="mt-8"><AskPanel documentId={doc.id} onCitation={(citation) => { setSelectedCitation(citation); setActiveClause(null); }} /></div><div className="mt-6 flex items-start gap-2 border-t border-border pt-4 text-[11px] leading-5 text-muted-foreground"><AlertCircle className="mt-0.5 size-3.5 shrink-0" />LexVeil provides document analysis support, not legal advice. Confirm every finding against the source and your professional judgment.</div></div></aside></div></AppShell>;
+}
+
+function Home() {
+  const [document, setDocument] = useState<DocumentRecord | null>(null);
+  const [processing, setProcessing] = useState(false);
+  function handleUploaded(next: DocumentRecord) { setProcessing(true); window.setTimeout(() => { setDocument(next); setProcessing(false); }, 500); }
+  if (processing) return <ProcessingPage />;
+  if (document) return <Workspace document={document} onReset={() => setDocument(null)} />;
+  return <UploadPage onUploaded={handleUploaded} />;
+}
+
+function Router() {
+  const [location] = useLocation();
+  return <ErrorBoundary resetKey={location}><Switch><Route path="/" component={Home} /><Route component={NotFound} /></Switch></ErrorBoundary>;
+}
+
+function App() {
+  return <QueryClientProvider client={queryClient}><TooltipProvider><WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, '')}><Router /></WouterRouter><Toaster /></TooltipProvider></QueryClientProvider>;
+}
+
+export default App;

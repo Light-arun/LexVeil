@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "LexVeil Legal Workspace"
+description = "A professional legal document analysis workspace for reviewing contracts, understanding clause risks, asking document-aware questions, and exporting a concise brief."
+version = "1.0.0"
+id = "artifacts/lexveil"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 24812
+
+[services.development]
+run = "pnpm --filter @workspace/lexveil run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/lexveil", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/lexveil/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "24812"
+BASE_PATH = "/"
